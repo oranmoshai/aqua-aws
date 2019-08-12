@@ -14,6 +14,8 @@ Metadata:
           - VpcCidr
           - EcsInstanceSubnets
           - LbSubnets
+          - GrpcLbSubnets
+          - GrpcLbScheme
       - Label:
           default: Aqua Security Configuration
         Parameters:
@@ -41,10 +43,14 @@ Metadata:
         default: VPC ID
       VpcCidr:
         default: VPC CIDR
+      GrpcLbScheme:
+        default: gRPC LB schema internet-facing|internal
       EcsInstanceSubnets:
         default: ECS Instance Subnets
       LbSubnets:
         default: Aqua LB Subnets
+      GrpcLbSubnets:
+        default: Aqua server gRPC LB Subnets
       AquaConsoleAccess:
         default: Web Console Source
       RdsInstanceName:
@@ -84,6 +90,12 @@ Parameters:
   VpcCidr:
     Description: 'For use by load balancer service polling. Enter VPC CIDR. Ex: 10.0.0.0/16'
     Type: String
+  GrpcLbScheme:
+    Description: 'gRPC LB schema internet-facing|internal'
+    Type: String
+    AllowedValues:
+      - internet-facing
+      - internal
   EcsInstanceSubnets:
     Type: 'List<AWS::EC2::Subnet::Id>'
     Description: Select all the subnets ECS utilizes
@@ -94,6 +106,9 @@ Parameters:
   LbSubnets:
    Type: 'List<AWS::EC2::Subnet::Id>'
    Description: Select external ones if you need internet access.
+  GrpcLbSubnets:
+   Type: 'List<AWS::EC2::Subnet::Id>'
+   Description: Select internal or external depend on your GrpcLbScheme
   AquaConsoleAccess:
     Description: The IP address or range that may be used to access the Aqua Console
     Type: String
@@ -220,11 +235,13 @@ Resources:
           PortMappings:
             - ContainerPort: '8080'
               HostPort: '8080'
+            - ContainerPort: '8443'
+              HostPort: '8443'
           Memory: '1024'
           Essential: 'true'
           Environment:
             - Name: AQUA_GRPC_MODE
-              Value: 0
+              Value: 1
             - Name: SCALOCK_DBSSL
               Value: require
             - Name: SCALOCK_AUDIT_DBSSL
@@ -264,6 +281,7 @@ Resources:
     DependsOn:
       - AquaConsoleTaskDefinition
       - AquaConsoleListener
+      - AquaConsoleGrpc
     Properties:
       Cluster: !Ref EcsClusterName
       ServiceName: !Join 
@@ -286,7 +304,55 @@ Resources:
               - aqua-console
           ContainerPort: '8080'
           TargetGroupArn: !Ref AquaConsoleTargetGroup
+        - ContainerName: !Join 
+            - '-'
+            - - !Ref EcsClusterName
+              - aqua-console
+          ContainerPort: '8443'
+          TargetGroupArn: !Ref AquaConsoleGrpcTargetGroup
       TaskDefinition: !Ref AquaConsoleTaskDefinition
+  AquaConsoleGrpc:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: !Join 
+        - '-'
+        - - !Ref EcsClusterName
+          - aquaConsoleGrpc
+      Scheme: !Ref GrpcLbScheme
+      Subnets: !Ref GrpcLbSubnets
+      Type: network
+  AquaConsoleGrpcListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    DependsOn:
+      - AquaConsoleGrpcTargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AquaConsoleGrpcTargetGroup
+      LoadBalancerArn: !Ref AquaConsoleGrpc
+      Port: '8443'
+      Protocol: TCP
+  AquaConsoleGrpcTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    DependsOn:
+      - AquaConsoleGrpc
+    Properties:
+      TargetType: instance
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: TCP
+      HealthyThresholdCount: 2
+      HealthCheckPort: 8443
+      Name: !Join 
+        - '-'
+        - - !Ref EcsClusterName
+          - aquaConsoleGrpc
+      Port: '8443'
+      Protocol: TCP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VpcId
   AquaConsoleListener:
     Type: 'AWS::ElasticLoadBalancingV2::Listener'
     DependsOn:
@@ -354,6 +420,7 @@ Resources:
     DependsOn:
       - AquaEcsTaskRole
       - RdsInstance
+      - AquaConsoleGrpc
     Properties:
       Family: !Join 
         - '-'
@@ -371,6 +438,13 @@ Resources:
           Memory: '1024'
           Essential: 'true'
           Environment:
+            - Name: AQUA_CONSOLE_SECURE_ADDRESS
+              Value: !Join 
+                - ''
+                - - !GetAtt 
+                    - AquaConsoleGrpc
+                    - DNSName
+                  - ':8443'
             - Name: SCALOCK_DBSSL
               Value: require
             - Name: SCALOCK_AUDIT_DBSSL
@@ -541,6 +615,15 @@ Resources:
       IpProtocol: tcp
       FromPort: 80
       ToPort: 80
+  EcsSecurityGroupIngress4:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Description: Allows inbound port 8443 from VPC to console gRPC.
+    Properties:
+      GroupId: !Ref EcsSecurityGroupId
+      CidrIp: !Ref VpcCidr
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
   AquaEcsTaskRole:
     Type: 'AWS::IAM::Role'
     Properties:
@@ -624,6 +707,15 @@ Outputs:
           - AquaConsole
           - DNSName
         - ':8080'
+  AquaConsoleGrpcConnection:
+    Description: >-
+      DNS to server gRPC
+    Value: !Join 
+      - ''
+      - - !GetAtt 
+          - AquaConsoleGrpc
+          - DNSName
+        - ':8443'
   AquaGatewayExternalConnection:
     Description: >-
       Aqua Enforcer gateway startup connection string for use when Enforcers are
